@@ -1,0 +1,2 @@
+"""FindPaper application package."""
+

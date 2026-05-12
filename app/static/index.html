@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FindPaper</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="header">
+          <div>
+            <h1>FindPaper</h1>
+            <p>开放学术文献检索、PDF 下载与高质量筛选</p>
+          </div>
+          <span class="badge">Local Web App</span>
+        </div>
+
+        <form id="job-form" class="form">
+          <label>
+            <span>主题/关键词</span>
+            <textarea
+              name="topic"
+              rows="4"
+              placeholder="例如：large language model retrieval augmented generation"
+            ></textarea>
+          </label>
+
+          <div class="grid">
+            <label>
+              <span>上传论文 PDF</span>
+              <input name="paper_pdf" type="file" accept="application/pdf" />
+            </label>
+            <label>
+              <span>目标下载数量</span>
+              <input name="target_count" type="number" min="1" max="100" value="10" />
+            </label>
+          </div>
+
+          <label>
+            <span>输出目录</span>
+            <input name="output_dir" type="text" placeholder="留空则使用默认 downloads 目录" />
+          </label>
+
+          <button id="submit-button" type="submit">开始检索</button>
+        </form>
+      </section>
+
+      <section class="panel status-panel">
+        <div class="status-header">
+          <h2>任务状态</h2>
+          <span id="status-pill" class="status-pill idle">Idle</span>
+        </div>
+        <div class="metrics">
+          <div><strong id="downloaded-count">0</strong><span>成功下载</span></div>
+          <div><strong id="failed-count">0</strong><span>无法下载</span></div>
+          <div><strong id="quality-count">0</strong><span>高质量</span></div>
+        </div>
+        <pre id="log" class="log">等待任务开始。</pre>
+        <div id="result" class="result"></div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
