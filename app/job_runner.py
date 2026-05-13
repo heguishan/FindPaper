@@ -24,7 +24,14 @@ class JobManager:
         """Initializes an empty job registry."""
         self.jobs: Dict[str, JobState] = {}
 
-    def create_job(self, topic: str, target_count: int, output_dir: Path) -> JobState:
+    def create_job(
+        self,
+        topic: str,
+        target_count: int,
+        output_dir: Path,
+        field_hint: str = "",
+        search_mode: str = "fast",
+    ) -> JobState:
         """Creates and schedules a background job."""
         job_id = uuid.uuid4().hex
         job = JobState(
@@ -33,6 +40,7 @@ class JobManager:
             target_count=target_count,
             output_dir=output_dir,
         )
+        job.result = {"field_hint": field_hint, "search_mode": search_mode}
         self.jobs[job_id] = job
         self.add_event(job, "queued", "任务已创建")
         asyncio.create_task(self.run_job(job))
@@ -59,8 +67,15 @@ class JobManager:
             high_quality_dir = ensure_directory(job.output_dir / f"{topic_name}高质量")
             reports_dir = ensure_directory(paper_dir / "reports")
 
-            self.add_event(job, "running", "正在检索开放学术来源")
-            papers = await search_client.search(job.topic, job.target_count)
+            field_hint = str(job.result.get("field_hint") or "")
+            search_mode = str(job.result.get("search_mode") or "fast")
+            self.add_event(job, "running", f"正在检索候选文献（{search_mode} 模式）")
+            papers = await search_client.search(
+                job.topic,
+                job.target_count,
+                field_hint=field_hint,
+                search_mode=search_mode,
+            )
             if not papers:
                 self.add_event(job, "completed", "未找到候选文献")
                 job.result = {
@@ -99,8 +114,10 @@ class JobManager:
             if shortfall:
                 message += f"，开放 PDF 不足目标数量，差额 {shortfall} 篇"
 
-            job.result = {
+            job.result.update({
                 "topic": job.topic,
+                "field_hint": field_hint,
+                "search_mode": search_mode,
                 "paper_dir": str(paper_dir),
                 "high_quality_dir": str(high_quality_dir),
                 "reports_dir": str(reports_dir),
@@ -109,7 +126,7 @@ class JobManager:
                 "failed_count": job.failed_count,
                 "high_quality_count": job.high_quality_count,
                 "shortfall": shortfall,
-            }
+            })
             self.add_event(job, "completed", message, result=job.result)
         except Exception as exc:  # Keeps UI friendly instead of losing background errors.
             self.add_event(job, "failed", f"任务失败：{exc}")

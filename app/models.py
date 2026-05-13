@@ -39,6 +39,7 @@ class Paper:
     venue: Optional[str] = None
     landing_page_url: Optional[str] = None
     pdf_url: Optional[str] = None
+    pdf_urls: List[str] = field(default_factory=list)
     source: str = "unknown"
     cited_by_count: int = 0
     normalized_citation_percentile: Optional[float] = None
@@ -95,4 +96,3 @@ def normalize_doi(doi: str) -> str:
 def normalize_title(title: str) -> str:
     """Normalizes a title for loose deduplication."""
     return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in title).split())
-

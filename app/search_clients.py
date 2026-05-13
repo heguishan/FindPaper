@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from typing import Any, Dict, Iterable, List, Optional
@@ -11,6 +12,15 @@ import httpx
 
 from app.config import settings
 from app.models import Paper, normalize_doi
+
+
+def unique_urls(urls: Iterable[Optional[str]]) -> List[str]:
+    """Returns non-empty URLs in first-seen order."""
+    unique: List[str] = []
+    for url in urls:
+        if url and url not in unique:
+            unique.append(url)
+    return unique
 
 
 def abstract_from_openalex_index(index: Optional[Dict[str, List[int]]]) -> Optional[str]:
@@ -54,7 +64,11 @@ def parse_openalex_work(item: Dict[str, Any]) -> Paper:
     if doi:
         doi = normalize_doi(doi)
 
-    pdf_url = best_oa.get("pdf_url") or (primary_location or {}).get("pdf_url")
+    locations = [best_oa, primary_location, *(item.get("locations") or [])]
+    pdf_urls = unique_urls(
+        location.get("pdf_url") for location in locations if isinstance(location, dict)
+    )
+    pdf_url = pdf_urls[0] if pdf_urls else None
     landing_page = item.get("doi") or best_oa.get("landing_page_url") or item.get("id")
     open_access = item.get("open_access") or {}
 
@@ -66,12 +80,13 @@ def parse_openalex_work(item: Dict[str, Any]) -> Paper:
         venue=source.get("display_name") if isinstance(source, dict) else None,
         landing_page_url=landing_page,
         pdf_url=pdf_url,
+        pdf_urls=pdf_urls,
         source="OpenAlex",
         cited_by_count=int(item.get("cited_by_count") or 0),
         normalized_citation_percentile=percentile,
         is_open_access=bool(open_access.get("is_oa") or pdf_url),
         abstract=abstract_from_openalex_index(item.get("abstract_inverted_index")),
-        metadata={"openalex_id": item.get("id")},
+        metadata={"openalex_id": item.get("id"), "pdf_urls": pdf_urls},
     )
 
 
@@ -93,11 +108,11 @@ def parse_crossref_item(item: Dict[str, Any]) -> Paper:
 
     doi = item.get("DOI")
     links = item.get("link") or []
-    pdf_url = None
+    pdf_urls = []
     for link in links:
         if "pdf" in (link.get("content-type") or "").lower():
-            pdf_url = link.get("URL")
-            break
+            pdf_urls.append(link.get("URL"))
+    pdf_urls = unique_urls(pdf_urls)
 
     venue = " ".join(item.get("container-title") or []) or None
     return Paper(
@@ -107,12 +122,13 @@ def parse_crossref_item(item: Dict[str, Any]) -> Paper:
         authors=authors,
         venue=venue,
         landing_page_url=item.get("URL"),
-        pdf_url=pdf_url,
+        pdf_url=pdf_urls[0] if pdf_urls else None,
+        pdf_urls=pdf_urls,
         source="Crossref",
         cited_by_count=int(item.get("is-referenced-by-count") or 0),
-        is_open_access=bool(pdf_url),
+        is_open_access=bool(pdf_urls),
         abstract=strip_html(item.get("abstract")),
-        metadata={"crossref_type": item.get("type")},
+        metadata={"crossref_type": item.get("type"), "pdf_urls": pdf_urls},
     )
 
 
@@ -122,6 +138,17 @@ def parse_semantic_scholar_item(item: Dict[str, Any]) -> Paper:
     doi = external_ids.get("DOI")
     open_pdf = item.get("openAccessPdf") or {}
     authors = [author.get("name") for author in item.get("authors") or [] if author.get("name")]
+    pdf_urls = unique_urls(
+        [
+            open_pdf.get("url"),
+            f"https://arxiv.org/pdf/{external_ids.get('ArXiv')}.pdf" if external_ids.get("ArXiv") else None,
+            (
+                f"https://www.ncbi.nlm.nih.gov/pmc/articles/{external_ids.get('PubMedCentral')}/pdf/"
+                if external_ids.get("PubMedCentral")
+                else None
+            ),
+        ]
+    )
     return Paper(
         title=html.unescape(item.get("title") or "Untitled"),
         doi=normalize_doi(doi) if doi else None,
@@ -129,12 +156,13 @@ def parse_semantic_scholar_item(item: Dict[str, Any]) -> Paper:
         authors=authors,
         venue=item.get("venue"),
         landing_page_url=item.get("url"),
-        pdf_url=open_pdf.get("url"),
+        pdf_url=pdf_urls[0] if pdf_urls else None,
+        pdf_urls=pdf_urls,
         source="Semantic Scholar",
         cited_by_count=int(item.get("citationCount") or 0),
-        is_open_access=bool(open_pdf.get("url") or item.get("isOpenAccess")),
+        is_open_access=bool(pdf_urls or item.get("isOpenAccess")),
         abstract=item.get("abstract"),
-        metadata={"paper_id": item.get("paperId")},
+        metadata={"paper_id": item.get("paperId"), "pdf_urls": pdf_urls},
     )
 
 
@@ -160,31 +188,57 @@ class AcademicSearchClient:
         """Closes the underlying HTTP client."""
         await self.client.aclose()
 
-    async def search(self, topic: str, target_count: int) -> List[Paper]:
+    async def search(
+        self,
+        topic: str,
+        target_count: int,
+        field_hint: str = "",
+        search_mode: str = "fast",
+    ) -> List[Paper]:
         """Searches all supported open metadata sources and deduplicates results.
 
         Args:
             topic: Query topic or keywords.
             target_count: Requested number of downloadable PDFs.
+            field_hint: User-provided field constraint.
+            search_mode: Either fast or deep.
 
         Returns:
             Deduplicated candidate papers.
         """
-        per_source = max(target_count * settings.max_candidates_multiplier, 20)
-        candidates: List[Paper] = []
-        for searcher in (
-            self.search_openalex,
-            self.search_semantic_scholar,
-            self.search_crossref,
-            self.search_arxiv,
-        ):
-            try:
-                candidates.extend(await searcher(topic, per_source))
-            except httpx.HTTPError:
-                continue
+        mode = search_mode if search_mode in {"fast", "deep"} else "fast"
+        topics = build_query_variants(topic, field_hint=field_hint)
+        per_source = candidate_limit(target_count, mode)
+        searchers = self.searchers_for_mode(mode)
+        tasks = [
+            self.safe_search(searcher, query, per_source)
+            for query in topics
+            for searcher in searchers
+        ]
+        results = await asyncio.gather(*tasks)
+        candidates = [paper for batch in results for paper in batch]
+        deduped = deduplicate_papers(candidates)
+        if mode == "deep":
+            deduped = await self.enrich_with_unpaywall(deduped)
+        return rank_downloadable_first(deduped, query=topic, field_hint=field_hint)
 
-        enriched = await self.enrich_with_unpaywall(candidates)
-        return deduplicate_papers(enriched)
+    def searchers_for_mode(self, mode: str):
+        """Returns metadata sources for the requested search mode."""
+        if mode == "deep":
+            return [
+                self.search_openalex,
+                self.search_semantic_scholar,
+                self.search_arxiv,
+                self.search_crossref,
+            ]
+        return [self.search_openalex, self.search_arxiv, self.search_semantic_scholar]
+
+    async def safe_search(self, searcher, topic: str, limit: int) -> List[Paper]:
+        """Runs a metadata search and converts failures into empty results."""
+        try:
+            return await searcher(topic, limit)
+        except (httpx.HTTPError, ValueError):
+            return []
 
     async def search_openalex(self, topic: str, limit: int) -> List[Paper]:
         """Searches OpenAlex works."""
@@ -193,6 +247,7 @@ class AcademicSearchClient:
             "per-page": min(limit, 200),
             "mailto": settings.contact_email,
             "sort": "cited_by_count:desc",
+            "filter": "is_oa:true",
         }
         response = await self.client.get("https://api.openalex.org/works", params=params)
         response.raise_for_status()
@@ -252,7 +307,12 @@ class AcademicSearchClient:
                 try:
                     unpaywall = await self.fetch_unpaywall(paper.doi)
                     if unpaywall:
-                        paper.pdf_url = unpaywall.get("pdf_url") or paper.pdf_url
+                        pdf_urls = unique_urls(
+                            [paper.pdf_url, *(paper.metadata.get("pdf_urls") or []), *unpaywall.get("pdf_urls", [])]
+                        )
+                        paper.metadata["pdf_urls"] = pdf_urls
+                        paper.pdf_urls = unique_urls([*paper.pdf_urls, *pdf_urls])
+                        paper.pdf_url = paper.pdf_url or unpaywall.get("pdf_url") or (pdf_urls[0] if pdf_urls else None)
                         paper.landing_page_url = unpaywall.get("landing_page_url") or paper.landing_page_url
                         paper.is_open_access = bool(paper.pdf_url or unpaywall.get("is_oa"))
                 except httpx.HTTPError:
@@ -271,9 +331,14 @@ class AcademicSearchClient:
         response.raise_for_status()
         data = response.json()
         best = data.get("best_oa_location") or {}
+        oa_locations = data.get("oa_locations") or []
+        pdf_urls = unique_urls(
+            [best.get("url_for_pdf"), *(location.get("url_for_pdf") for location in oa_locations)]
+        )
         return {
             "is_oa": data.get("is_oa"),
-            "pdf_url": best.get("url_for_pdf"),
+            "pdf_url": pdf_urls[0] if pdf_urls else None,
+            "pdf_urls": pdf_urls,
             "landing_page_url": best.get("url"),
         }
 
@@ -306,12 +371,24 @@ def merge_paper_metadata(target: Paper, source: Paper) -> None:
     target.venue = target.venue or source.venue
     target.landing_page_url = target.landing_page_url or source.landing_page_url
     target.pdf_url = target.pdf_url or source.pdf_url
+    pdf_urls = unique_urls(
+        [
+            target.pdf_url,
+            *target.pdf_urls,
+            *(target.metadata.get("pdf_urls") or []),
+            source.pdf_url,
+            *source.pdf_urls,
+            *(source.metadata.get("pdf_urls") or []),
+        ]
+    )
+    target.pdf_urls = pdf_urls
     target.abstract = target.abstract or source.abstract
     target.is_open_access = target.is_open_access or source.is_open_access
     target.cited_by_count = max(target.cited_by_count, source.cited_by_count)
     if target.normalized_citation_percentile is None:
         target.normalized_citation_percentile = source.normalized_citation_percentile
     target.metadata.update({key: value for key, value in source.metadata.items() if value})
+    target.metadata["pdf_urls"] = pdf_urls
 
 
 def parse_arxiv_feed(feed_xml: str) -> List[Paper]:
@@ -346,6 +423,7 @@ def parse_arxiv_feed(feed_xml: str) -> List[Paper]:
                 venue="arXiv",
                 landing_page_url=landing_url,
                 pdf_url=pdf_url,
+                pdf_urls=unique_urls([pdf_url]),
                 source="arXiv",
                 is_open_access=bool(pdf_url),
                 abstract=summary,
@@ -353,3 +431,68 @@ def parse_arxiv_feed(feed_xml: str) -> List[Paper]:
         )
     return papers
 
+
+def build_query_variants(topic: str, field_hint: str = "") -> List[str]:
+    """Builds a few AND-style academic search variants.
+
+    The first variant is always the confirmed query plus field constraint. Extra
+    variants are conservative fallbacks, not broad OR-style expansion.
+    """
+    cleaned = re.sub(r"\s+", " ", topic).strip()
+    field = re.sub(r"\s+", " ", field_hint).strip()
+    combined = " ".join(part for part in [field, cleaned] if part)
+    variants = [combined] if combined else []
+    words = [
+        word
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", cleaned)
+        if word.lower() not in {"and", "or", "the"}
+    ]
+    if field and cleaned:
+        variants.append(cleaned)
+    if len(words) > 8:
+        variants.append(" ".join(part for part in [field, " ".join(words[:8])] if part))
+    return unique_urls(variants)[:3]
+
+
+def candidate_limit(target_count: int, mode: str) -> int:
+    """Returns per-source candidate count for the selected mode."""
+    if mode == "deep":
+        return max(target_count * settings.max_candidates_multiplier, 30)
+    return max(target_count * 2, 12)
+
+
+def rank_downloadable_first(
+    papers: Iterable[Paper],
+    query: str = "",
+    field_hint: str = "",
+) -> List[Paper]:
+    """Ranks open and directly downloadable candidates before weaker records."""
+    return sorted(
+        papers,
+        key=lambda paper: (
+            relevance_score(paper, query=query, field_hint=field_hint),
+            bool(paper.pdf_url or paper.pdf_urls or paper.metadata.get("pdf_urls")),
+            paper.is_open_access,
+            paper.cited_by_count,
+            paper.year or 0,
+        ),
+        reverse=True,
+    )
+
+
+def relevance_score(paper: Paper, query: str = "", field_hint: str = "") -> int:
+    """Scores rough title/abstract/venue relevance for ranking only."""
+    haystack = " ".join(
+        [
+            paper.title,
+            paper.abstract or "",
+            paper.venue or "",
+            " ".join(paper.authors),
+        ]
+    ).lower()
+    terms = [
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", f"{field_hint} {query}")
+        if term.lower() not in {"and", "or", "the", "with", "for"}
+    ]
+    return sum(1 for term in terms if term in haystack)

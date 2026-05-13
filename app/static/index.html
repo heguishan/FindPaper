@@ -16,6 +16,7 @@
           </div>
           <span class="badge">Local Web App</span>
         </div>
+        <div id="config-banner" class="config-banner"></div>
 
         <form id="job-form" class="form">
           <label>
@@ -23,8 +24,17 @@
             <textarea
               name="topic"
               rows="4"
-              placeholder="例如：large language model retrieval augmented generation"
+              placeholder="例如：载流子俘获 或 carrier capture"
             ></textarea>
+          </label>
+
+          <label>
+            <span>领域限定</span>
+            <input
+              name="field_hint"
+              type="text"
+              placeholder="例如：半导体缺陷物理 / 光电材料 / 宽禁带半导体"
+            />
           </label>
 
           <div class="grid">
@@ -38,12 +48,37 @@
             </label>
           </div>
 
+          <section id="plan-panel" class="plan-panel hidden">
+            <div class="status-header">
+              <h2>检索方案</h2>
+              <span id="plan-confidence" class="badge">未生成</span>
+            </div>
+            <label>
+              <span>确认后的最终查询</span>
+              <textarea name="final_query" rows="3" placeholder="生成检索方案后会填入推荐查询"></textarea>
+            </label>
+            <div class="grid">
+              <label>
+                <span>检索模式</span>
+                <select name="search_mode">
+                  <option value="fast" selected>快速检索</option>
+                  <option value="deep">深度检索</option>
+                </select>
+              </label>
+            </div>
+            <div id="plan-summary" class="plan-summary"></div>
+            <div id="query-options" class="query-options"></div>
+          </section>
+
           <label>
             <span>输出目录</span>
             <input name="output_dir" type="text" placeholder="留空则使用默认 downloads 目录" />
           </label>
 
-          <button id="submit-button" type="submit">开始检索</button>
+          <div class="actions">
+            <button id="plan-button" type="button">生成检索方案</button>
+            <button id="submit-button" type="submit">开始检索下载</button>
+          </div>
         </form>
       </section>
 

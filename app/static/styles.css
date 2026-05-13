@@ -77,6 +77,16 @@ label span,
   white-space: nowrap;
 }
 
+.config-banner {
+  margin-top: 16px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.config-banner.warning {
+  color: var(--danger);
+}
+
 .status-pill.running {
   color: var(--accent);
   border-color: var(--accent);
@@ -104,7 +114,8 @@ label {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -142,6 +153,71 @@ button:hover {
 button:disabled {
   opacity: 0.6;
   cursor: wait;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.actions button[type="button"] {
+  background: #2f5d50;
+}
+
+.actions button[type="button"]:hover {
+  background: #24473d;
+}
+
+.hidden {
+  display: none;
+}
+
+.plan-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+  background: #f8fafc;
+}
+
+.plan-summary {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.query-options {
+  display: grid;
+  gap: 10px;
+}
+
+.query-option {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+  display: grid;
+  gap: 6px;
+}
+
+.query-option label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text);
+}
+
+.query-option input {
+  width: auto;
+  margin-top: 3px;
+}
+
+.query-option code {
+  color: var(--accent-dark);
+  overflow-wrap: anywhere;
 }
 
 .status-panel {
@@ -201,4 +277,3 @@ button:disabled {
     margin: 16px auto;
   }
 }
-

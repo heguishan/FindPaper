@@ -18,10 +18,14 @@ env/
 # Local configuration and outputs
 .env
 downloads/
+uvicorn*.log
 
 # Editor and OS files
-.vscode/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
 .idea/
 .DS_Store
 Thumbs.db
-

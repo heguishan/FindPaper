@@ -14,7 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.job_runner import job_manager, resolve_output_dir
-from app.topic_extraction import extract_topic_from_pdf
+from app.llm_client import DeepSeekClient, fallback_search_plan, search_plan_to_dict
+from app.topic_extraction import extract_local_topic_from_text, extract_text_from_pdf
 
 
 app = FastAPI(title="FindPaper", version="0.1.0")
@@ -31,6 +32,9 @@ async def index() -> str:
 @app.post("/api/jobs")
 async def create_job(
     topic: str = Form(""),
+    field_hint: str = Form(""),
+    final_query: str = Form(""),
+    search_mode: str = Form("fast"),
     target_count: int = Form(10),
     output_dir: str = Form(""),
     paper_pdf: Optional[UploadFile] = File(None),
@@ -46,12 +50,15 @@ async def create_job(
     Returns:
         JSON payload with the created job ID.
     """
-    clean_topic = topic.strip()
+    clean_topic = (final_query or topic).strip()
+    clean_field_hint = field_hint.strip()
+    clean_search_mode = normalize_search_mode(search_mode)
     if target_count < 1:
         raise HTTPException(status_code=400, detail="论文数量必须大于 0。")
     if target_count > 100:
         raise HTTPException(status_code=400, detail="单次最多请求 100 篇论文。")
 
+    extraction_note = ""
     if paper_pdf and paper_pdf.filename:
         if not paper_pdf.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="上传文件必须是 PDF。")
@@ -59,10 +66,32 @@ async def create_job(
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                 tmp_file.write(await paper_pdf.read())
                 tmp_path = Path(tmp_file.name)
-            clean_topic = extract_topic_from_pdf(tmp_path)
+            pdf_text = extract_text_from_pdf(tmp_path)
+            local_topic, _, _ = extract_local_topic_from_text(pdf_text)
+            clean_topic = clean_topic or local_topic or ""
+            if settings.enable_llm_topic_extraction and settings.deepseek_api_key:
+                deepseek = DeepSeekClient()
+                try:
+                    plan = await deepseek.generate_search_plan(
+                        topic=topic,
+                        field_hint=clean_field_hint,
+                        pdf_text=pdf_text,
+                        local_topic_hint=local_topic or clean_topic,
+                    )
+                    if not final_query and plan.recommended_query:
+                        clean_topic = plan.recommended_query
+                        extraction_note = f"DeepSeek 已生成检索查询，置信度 {plan.confidence:.2f}"
+                finally:
+                    await deepseek.close()
         except ValueError as exc:
             if not clean_topic:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            if not clean_topic:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"PDF 主题提取失败：{exc}。请检查 DeepSeek API Key 或手动输入主题。",
+                ) from exc
         finally:
             try:
                 tmp_path.unlink(missing_ok=True)  # type: ignore[name-defined]
@@ -77,8 +106,66 @@ async def create_job(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    job = job_manager.create_job(clean_topic, target_count, resolved_output_dir)
-    return JSONResponse({"job_id": job.job_id, "topic": job.topic})
+    job = job_manager.create_job(
+        clean_topic,
+        target_count,
+        resolved_output_dir,
+        field_hint=clean_field_hint,
+        search_mode=clean_search_mode,
+    )
+    return JSONResponse({"job_id": job.job_id, "topic": job.topic, "note": extraction_note})
+
+
+@app.post("/api/search-plan")
+async def create_search_plan(
+    topic: str = Form(""),
+    field_hint: str = Form(""),
+    paper_pdf: Optional[UploadFile] = File(None),
+) -> JSONResponse:
+    """Creates a user-confirmable search plan before downloading papers."""
+    clean_topic = topic.strip()
+    clean_field_hint = field_hint.strip()
+    pdf_text = ""
+    local_topic = ""
+    tmp_path: Optional[Path] = None
+
+    if paper_pdf and paper_pdf.filename:
+        if not paper_pdf.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="上传文件必须是 PDF。")
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(await paper_pdf.read())
+                tmp_path = Path(tmp_file.name)
+            pdf_text = extract_text_from_pdf(tmp_path)
+            local_topic, _, _ = extract_local_topic_from_text(pdf_text)
+        except ValueError as exc:
+            if not clean_topic:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            if tmp_path:
+                tmp_path.unlink(missing_ok=True)
+
+    if not clean_topic and not local_topic:
+        raise HTTPException(status_code=400, detail="请输入主题/关键词，或上传包含 Abstract 的论文 PDF。")
+
+    if settings.enable_llm_topic_extraction and settings.deepseek_api_key:
+        deepseek = DeepSeekClient()
+        try:
+            plan = await deepseek.generate_search_plan(
+                topic=clean_topic,
+                field_hint=clean_field_hint,
+                pdf_text=pdf_text,
+                local_topic_hint=local_topic,
+            )
+        except Exception as exc:
+            plan = fallback_search_plan(clean_topic, clean_field_hint, local_topic)
+            plan.notes = f"DeepSeek 生成失败，已使用手动方案：{exc}"
+        finally:
+            await deepseek.close()
+    else:
+        plan = fallback_search_plan(clean_topic, clean_field_hint, local_topic)
+
+    return JSONResponse(search_plan_to_dict(plan))
 
 
 @app.get("/api/jobs/{job_id}")
@@ -136,5 +223,16 @@ async def stream_events(job_id: str) -> StreamingResponse:
 @app.get("/api/config")
 async def get_config() -> JSONResponse:
     """Returns UI defaults."""
-    return JSONResponse({"default_output_dir": str(settings.default_output_dir)})
+    return JSONResponse(
+        {
+            "default_output_dir": str(settings.default_output_dir),
+            "deepseek_configured": bool(settings.deepseek_api_key.strip()),
+            "llm_enabled": settings.enable_llm_topic_extraction,
+            "deepseek_model": settings.deepseek_model,
+        }
+    )
 
+
+def normalize_search_mode(value: str) -> str:
+    """Normalizes user-selected search mode."""
+    return value if value in {"fast", "deep"} else "fast"

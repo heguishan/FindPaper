@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 
 STOPWORDS = {
@@ -68,6 +68,38 @@ STOPWORDS = {
     "with",
 }
 
+CHINESE_STOPWORDS = {
+    "本文",
+    "研究",
+    "方法",
+    "结果",
+    "表明",
+    "通过",
+    "进行",
+    "具有",
+    "提出",
+    "分析",
+    "影响",
+    "基于",
+    "一种",
+    "以及",
+    "其中",
+    "可以",
+    "为了",
+    "采用",
+    "发现",
+    "实现",
+    "相关",
+    "主要",
+}
+
+ABSTRACT_HEADING = r"(?:a\s*b\s*s\s*t\s*r\s*a\s*c\s*t|abstract|summary|摘要|摘\s*要)"
+ABSTRACT_END_HEADING = (
+    r"(?:keywords?|key\s*words?|index\s*terms?|"
+    r"(?:1|i|Ⅰ|一)?\.?\s*(?:introduction|background|overview|引言|绪论|前言|背景)|"
+    r"关键词|关键字)"
+)
+
 
 def extract_text_from_pdf(pdf_path: Path, max_pages: int = 5) -> str:
     """Extracts text from the first pages of a PDF.
@@ -112,19 +144,66 @@ def extract_abstract(text: str) -> Optional[str]:
     Returns:
         Abstract content, or None when no section can be identified.
     """
-    normalized = re.sub(r"[ \t]+", " ", text)
-    normalized = re.sub(r"\n+", "\n", normalized)
-    pattern = re.compile(
-        r"(?is)(?:^|\n)\s*(?:abstract|summary)\s*[:.\-]?\s*(.*?)"
-        r"(?=\n\s*(?:1\.?\s*)?(?:introduction|keywords?|index terms|background)\b|$)"
-    )
-    match = pattern.search(normalized)
-    if not match:
-        return None
-    abstract = re.sub(r"\s+", " ", match.group(1)).strip()
-    if len(abstract.split()) < 20:
-        return None
-    return abstract
+    normalized = normalize_extracted_text(text)
+    patterns = [
+        re.compile(
+            rf"(?is)(?:^|\n|\r)\s*{ABSTRACT_HEADING}\s*[:：.\-—–]?\s*(.*?)"
+            rf"(?=(?:\n|\r)\s*{ABSTRACT_END_HEADING}\b|$)"
+        ),
+        re.compile(
+            rf"(?is)\b{ABSTRACT_HEADING}\b\s*[:：.\-—–]?\s*(.*?)"
+            rf"(?=\s+{ABSTRACT_END_HEADING}\b|$)"
+        ),
+        re.compile(
+            rf"(?s){ABSTRACT_HEADING}\s*[:：.\-—–]?\s*(.*?)"
+            rf"(?={ABSTRACT_END_HEADING}|$)"
+        ),
+    ]
+
+    for pattern in patterns:
+        match = pattern.search(normalized)
+        if match:
+            abstract = clean_abstract(match.group(1))
+            if is_usable_abstract(abstract):
+                return abstract
+    return None
+
+
+def normalize_extracted_text(text: str) -> str:
+    """Normalizes noisy text extracted from PDFs.
+
+    Args:
+        text: Raw text from pypdf or tests.
+
+    Returns:
+        Text with predictable spacing while preserving line breaks.
+    """
+    text = text.replace("\r", "\n")
+    text = re.sub(r"-\s*\n\s*", "", text)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\n\s+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def clean_abstract(value: str) -> str:
+    """Cleans extracted abstract text."""
+    abstract = re.sub(r"\s+", " ", value).strip(" :：.-—–")
+    abstract = re.sub(r"^(?:abstract|summary|摘要|摘\s*要)\s*[:：.\-—–]?\s*", "", abstract, flags=re.I)
+    return abstract.strip()
+
+
+def is_usable_abstract(abstract: str) -> bool:
+    """Returns whether an extracted abstract has enough content."""
+    if not abstract:
+        return False
+    english_words = re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", abstract)
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", abstract)
+    if len(english_words) >= 20:
+        return True
+    if len(chinese_chars) >= 40:
+        return True
+    return len(abstract) >= 160
 
 
 def tokenize_keywords(text: str) -> Iterable[str]:
@@ -133,6 +212,20 @@ def tokenize_keywords(text: str) -> Iterable[str]:
         token = token.strip("-")
         if len(token) >= 3 and token not in STOPWORDS:
             yield token
+
+
+def tokenize_chinese_keywords(text: str) -> Iterable[str]:
+    """Tokenizes Chinese abstract text into simple keyword candidates.
+
+    This intentionally avoids external NLP dependencies. It creates short
+    overlapping Chinese character chunks and ranks repeated chunks higher.
+    """
+    chinese_text = "".join(re.findall(r"[\u4e00-\u9fff]+", text))
+    for size in (6, 5, 4, 3, 2):
+        for index in range(0, max(len(chinese_text) - size + 1, 0)):
+            token = chinese_text[index : index + size]
+            if token not in CHINESE_STOPWORDS and not any(stop in token for stop in CHINESE_STOPWORDS):
+                yield token
 
 
 def extract_keywords_from_abstract(abstract: str, max_keywords: int = 8) -> List[str]:
@@ -146,7 +239,9 @@ def extract_keywords_from_abstract(abstract: str, max_keywords: int = 8) -> List
         Ordered keywords and short keyphrases.
     """
     tokens = list(tokenize_keywords(abstract))
+    chinese_tokens = list(tokenize_chinese_keywords(abstract))
     counts = Counter(tokens)
+    chinese_counts = Counter(chinese_tokens)
     phrase_counts: Counter[str] = Counter()
     for first, second in zip(tokens, tokens[1:]):
         if first != second:
@@ -156,9 +251,12 @@ def extract_keywords_from_abstract(abstract: str, max_keywords: int = 8) -> List
         phrase for phrase, count in phrase_counts.most_common() if count > 1 and len(phrase) <= 60
     ]
     ranked_terms = [term for term, _ in counts.most_common()]
+    ranked_chinese_terms = [
+        term for term, count in chinese_counts.most_common() if count > 1 or len(chinese_counts) <= max_keywords
+    ]
 
     results: List[str] = []
-    for candidate in [*ranked_phrases, *ranked_terms]:
+    for candidate in [*ranked_phrases, *ranked_terms, *ranked_chinese_terms]:
         if candidate not in results:
             results.append(candidate)
         if len(results) >= max_keywords:
@@ -186,3 +284,21 @@ def extract_topic_from_pdf(pdf_path: Path) -> str:
     if not keywords:
         raise ValueError("已识别 Abstract，但未能提取有效关键词，请手动输入主题。")
     return " ".join(keywords)
+
+
+def extract_local_topic_from_text(text: str) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Extracts a topic from text using local Abstract heuristics.
+
+    Args:
+        text: Raw PDF text.
+
+    Returns:
+        Tuple of topic, abstract, and keyword list. Missing values are None or empty.
+    """
+    abstract = extract_abstract(text)
+    if not abstract:
+        return None, None, []
+    keywords = extract_keywords_from_abstract(abstract)
+    if not keywords:
+        return None, abstract, []
+    return " ".join(keywords), abstract, keywords
